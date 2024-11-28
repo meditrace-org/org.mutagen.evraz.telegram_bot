@@ -1,71 +1,130 @@
 import io
-from zipfile import ZipFile
-
+import asyncio
+from asyncio import sleep
+from aiogram.types import InputFile, Message
+import aiohttp
+from fastapi import FastAPI, Request
 from decouple import config
-from telebot import TeleBot
+from cachetools import TTLCache
+from telebot.types import InputFile
+from aiogram import Bot, Dispatcher, types
+from aiogram.filters import CommandStart, Command
+from aiogram import F
 
-# Загрузка конфигурации из .env файла
-TOKEN = config('TELEGRAM_TOKEN')
-
-
-def create_report(report_path, contents):
-    # Для создания файла репорта, можно править для ваших потребностей
-    with open(report_path, "w") as file:
-        file.write(contents)
-    return report_path
-
-
-# Функция для обработки файлов и создания репортов
-def process_file(file) -> str:
-    # Здесь должна быть логика обработки файла
-    print("Processing file:", file)
-    report = create_report("report.txt", "Hello world")
-    return report
+app = FastAPI()
+EVRAZ_API_URL = config("EVRAZ_API_URL")
+TOKEN = config("TELEGRAM_TOKEN")
+bot = Bot(token=TOKEN)
+dp = Dispatcher()
+cache = TTLCache(maxsize=1000, ttl=3600)
+instructions = dict()
 
 
-# Функция для обработки архивов
-def process_archive(zip_file):
-    with ZipFile(io.BytesIO(zip_file), 'r') as archive:
-        for file in archive.namelist():
-            with archive.open(file) as nested_file:
-                file_contents = nested_file.readlines()
-                # Здесь должна быть логика обработки архива
+@app.post("/webhook")
+async def handle_webhook(request: Request):
+    data = await request.json()
+    if "request_id" not in data or "report_file_url" not in data:
+        if "record_id" in data:
+            record_id = data["record_id"]
+            if record_id in cache:
+                chat_data = cache[record_id]
+                status = data.get("status", "unknown")
+                chat_id = chat_data["chat_id"]
+                message_id = chat_data["message_id"]
+                await bot.send_message(chat_id, "Запрос не успешный, отсутствует report_file_url.")
+                await bot.send_message(
+                    chat_id=chat_id,
+                    reply_to_message_id=message_id,
+                    text=f"⚠️ К сожалению, ваш запрос обработан с ошибкой.\nСтатус запроса: {status}."
+                )
+            return
+        else:
+            return
 
-    report = create_report("report.txt", "Hello world")
-    return report
+    request_id = data["request_id"]
+    report_file_url = data["report_file_url"]
+
+    if request_id not in cache:
+        return
+
+    chat_data = cache[request_id]
+    chat_id = chat_data["chat_id"]
+    message_id = chat_data["message_id"]
+
+    async with aiohttp.ClientSession() as session:
+        async with session.get(report_file_url) as response:
+            if response.status != 200:
+                return
+            file_data = io.BytesIO(await response.read())
+    file_data.name = "report.pdf"
+
+    await bot.send_document(
+        chat_id=chat_id,
+        document=InputFile(file_data),
+        reply_to_message_id=message_id,
+        caption=f"☑️ Ваш отчет успешно составлен."
+    )
 
 
-# Создание бота и обработка сообщений
-bot = TeleBot(TOKEN)
-
-
-@bot.message_handler(content_types=['document'])
-def handle_document(message):
-    file_info = bot.get_file(message.document.file_id)
-    downloaded_file = bot.download_file(file_info.file_path)
-
-    if message.document.file_name.endswith('.zip'):
-        result_report = process_archive(downloaded_file)
-        r_type = "архив"
+@dp.message(Command("set_instr"))
+async def set_instructions(message: types.Message):
+    if message.document is not None:
+        file_url = await get_file_url(message.document)
+        instructions[message.from_user.id] = file_url
+        await message.reply("☑️ Инструкции успешно установлены.")
     else:
-        result_report = process_file(downloaded_file)
-        r_type = "файл"
-
-    bot.reply_to(message, f"Ваш {r_type} был обработан, результаты прикреплены к сообщению.")
-    with open(result_report, "rb") as report_file:
-        bot.send_document(chat_id=message.chat.id, document=report_file)
+        await message.reply("⚠️ Пожалуйста, отправьте команду вместе с документом с инструкциями.")
 
 
-@bot.message_handler(commands=['start'])
-def start_message(message):
-    bot.reply_to(message, "Привет! Я бот для проверки проектов. Отправьте мне файл или архив для обработки.")
+@dp.message(F.content_type == types.ContentType.DOCUMENT)
+async def handle_document_updates(message: types.Message):
+    user_id = message.from_user.id
+    if user_id not in instructions:
+        await message.reply("⚠️ Сначала установите инструкции по ревью проекта, используя /set_instr.")
+        return
+    if message.document is None:
+        await message.reply("⚠️ Не удалось обработать документ.")
+        return
+
+    target_file_url = await get_file_url(message.document)
+    instructions_file_url = instructions[user_id]
+    data = {
+        "instructions_file_url": instructions_file_url,
+        "target_file_url": target_file_url
+    }
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.post(f"{EVRAZ_API_URL}/upload", json=data, timeout=5) as response:
+                if response.status == 200:
+                    reply_message = await message.reply("⏳ Принятно в обработку. Ожидайте.")
+                    await sleep(3)
+                    await reply_message.delete()
+                else:
+                    await message.reply(f"❌ Ошибка при отправке данных в АПИ. Код ошибки: {response.status}")
+        except Exception:
+            await message.reply("❌ Произошла неизвестная ошибка.")
 
 
-@bot.message_handler(func=lambda message: True)
-def unknown_command(message):
-    bot.reply_to(message, "Я не знаю, что делать с этим. Пожалуйста, отправьте мне файл или архив для обработки.")
+@dp.message(CommandStart())
+async def start_message(message: Message):
+    await message.reply("Привет! Я бот для проверки проектов. Отправьте мне файл или архив для обработки.")
+
+
+@dp.message(F.text)
+async def unknown_command(message: Message):
+    await message.reply("Я не знаю, что делать с этим. Пожалуйста, отправьте мне файл или архив для обработки.")
+
+
+async def get_file_url(document: types.Document):
+    file_id = document.file_id
+    tg_file = await bot.get_file(file_id)
+    file_url = f"https://api.telegram.org/file/bot{TOKEN}/{tg_file.file_path}"
+    return file_url
+
+
+async def main():
+    await dp.start_polling(bot)
 
 
 if __name__ == '__main__':
-    print("Bot started")
-    bot.infinity_polling()
+    asyncio.run(main())
