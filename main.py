@@ -3,6 +3,7 @@ import asyncio
 from asyncio import sleep
 from aiogram.types import InputFile, Message
 import aiohttp
+import uvicorn
 from fastapi import FastAPI, Request
 from decouple import config
 from cachetools import TTLCache
@@ -122,9 +123,19 @@ async def get_file_url(document: types.Document):
     return file_url
 
 
-async def main():
+async def on_start():
     await dp.start_polling(bot)
 
 
+async def run():
+    server = uvicorn.Server(
+        uvicorn.Config(app, host="0.0.0.0", port=8010)
+    )
+
+    bot_task = asyncio.create_task(on_start())
+    server_task = asyncio.create_task(server.serve())
+
+    await asyncio.gather(server_task, bot_task)
+
 if __name__ == '__main__':
-    asyncio.run(main())
+    asyncio.run(run())
