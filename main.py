@@ -119,7 +119,7 @@ async def handle_document_updates(message: types.Message):
     async with aiohttp.ClientSession() as session:
         try:
             async with session.post(f"{EVRAZ_API_URL}/upload", json=data, timeout=5) as response:
-                if response.status == 200:
+                if response.status in [200, 202]:
                     response_data = await response.json()
                     cache[response_data["request_id"]] = {
                         "chat_id": message.chat.id,
