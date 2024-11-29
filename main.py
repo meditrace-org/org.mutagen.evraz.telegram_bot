@@ -1,5 +1,6 @@
 import io
 import asyncio
+import os
 
 from aiogram.fsm.context import FSMContext
 from aiogram.types import InputFile, Message, BufferedInputFile
@@ -159,7 +160,7 @@ async def on_start():
 
 async def run():
     server = uvicorn.Server(
-        uvicorn.Config(app, host="0.0.0.0", port=8010)
+        uvicorn.Config(app, host="0.0.0.0", port=int(os.getenv("EVRAZ_TG_BOT_PORT", "8010")))
     )
 
     bot_task = asyncio.create_task(on_start())
