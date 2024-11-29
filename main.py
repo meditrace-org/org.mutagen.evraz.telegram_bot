@@ -1,7 +1,8 @@
 import io
 import asyncio
-from asyncio import sleep
-from aiogram.types import InputFile, Message
+
+from aiogram.fsm.context import FSMContext
+from aiogram.types import InputFile, Message, BufferedInputFile
 import aiohttp
 import uvicorn
 from fastapi import FastAPI, Request
@@ -10,6 +11,7 @@ from cachetools import TTLCache
 from telebot.types import InputFile
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import CommandStart, Command
+from aiogram.fsm.state import State, StatesGroup
 from aiogram import F
 
 app = FastAPI()
@@ -17,7 +19,7 @@ EVRAZ_API_URL = config("EVRAZ_API_URL")
 TOKEN = config("TELEGRAM_TOKEN")
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
-cache = TTLCache(maxsize=1000, ttl=3600)
+cache = TTLCache(maxsize=10000, ttl=3600)
 instructions = dict()
 
 
@@ -25,22 +27,18 @@ instructions = dict()
 async def handle_webhook(request: Request):
     data = await request.json()
     if "request_id" not in data or "report_file_url" not in data:
-        if "record_id" in data:
-            record_id = data["record_id"]
-            if record_id in cache:
-                chat_data = cache[record_id]
-                status = data.get("status", "unknown")
-                chat_id = chat_data["chat_id"]
-                message_id = chat_data["message_id"]
-                await bot.send_message(chat_id, "Запрос не успешный, отсутствует report_file_url.")
-                await bot.send_message(
-                    chat_id=chat_id,
-                    reply_to_message_id=message_id,
-                    text=f"⚠️ К сожалению, ваш запрос обработан с ошибкой.\nСтатус запроса: {status}."
-                )
-            return
-        else:
-            return
+        request_id = data["request_id"]
+        if request_id in cache:
+            chat_data = cache[request_id]
+            status = data.get("status", "unknown")
+            chat_id = chat_data["chat_id"]
+            message_id = chat_data["message_id"]
+            await bot.send_message(chat_id, "Запрос не успешный, отсутствует report_file_url.")
+            await bot.send_message(
+                chat_id=chat_id,
+                reply_to_message_id=message_id,
+                text=f"⚠️ К сожалению, ваш запрос обработан с ошибкой.\nСтатус запроса: {status}."
+            )
 
     request_id = data["request_id"]
     report_file_url = data["report_file_url"]
@@ -56,25 +54,49 @@ async def handle_webhook(request: Request):
         async with session.get(report_file_url) as response:
             if response.status != 200:
                 return
-            file_data = io.BytesIO(await response.read())
-    file_data.name = "report.pdf"
+            file_data = await response.read()
+
+    input_file = BufferedInputFile(file=file_data, filename="report.pdf")
 
     await bot.send_document(
         chat_id=chat_id,
-        document=InputFile(file_data),
+        document=input_file,
         reply_to_message_id=message_id,
-        caption=f"☑️ Ваш отчет успешно составлен."
+        caption="☑️ Ваш отчет успешно составлен."
     )
 
 
+class Form(StatesGroup):
+    set_instructions_state = State()
+
+
 @dp.message(Command("set_instr"))
+async def set_instructions_handler(message: types.Message, state: FSMContext):
+    if message.document is not None:
+        await set_instructions(message)
+        await state.clear()
+    else:
+        await state.set_state(Form.set_instructions_state)
+        await message.reply("📝 Отправьте файл с инструкциями в формате PDF.")
+
+
 async def set_instructions(message: types.Message):
     if message.document is not None:
         file_url = await get_file_url(message.document)
+        has_prev = message.from_user.id in instructions
         instructions[message.from_user.id] = file_url
-        await message.reply("☑️ Инструкции успешно установлены.")
-    else:
-        await message.reply("⚠️ Пожалуйста, отправьте команду вместе с документом с инструкциями.")
+        await message.reply(
+            f"☑️ Инструкции успешно {'обновлены' if has_prev else 'установлены'}."
+        )
+
+
+@dp.message(Form.set_instructions_state)
+async def set_instructions_state_handler(message: types.Message, state: FSMContext):
+    if message.document is None:
+        await message.reply("⚠️ Пожалуйста, отправьте файл с инструкциями в формате PDF.")
+        return
+    await set_instructions(message)
+    await state.clear()
 
 
 @dp.message(F.content_type == types.ContentType.DOCUMENT)
@@ -97,9 +119,12 @@ async def handle_document_updates(message: types.Message):
         try:
             async with session.post(f"{EVRAZ_API_URL}/upload", json=data, timeout=5) as response:
                 if response.status == 200:
-                    reply_message = await message.reply("⏳ Принятно в обработку. Ожидайте.")
-                    await sleep(3)
-                    await reply_message.delete()
+                    response_data = await response.json()
+                    cache[response_data["request_id"]] = {
+                        "chat_id": message.chat.id,
+                        "message_id": message.message_id
+                    }
+                    await message.reply("⏳ Принято в обработку. Ожидайте.")
                 else:
                     await message.reply(f"❌ Ошибка при отправке данных в АПИ. Код ошибки: {response.status}")
         except Exception:
@@ -107,13 +132,18 @@ async def handle_document_updates(message: types.Message):
 
 
 @dp.message(CommandStart())
-async def start_message(message: Message):
-    await message.reply("Привет! Я бот для проверки проектов. Отправьте мне файл или архив для обработки.")
+async def start_message(message: Message, state: FSMContext):
+    await message.reply(
+        "👋 Привет! Я бот для проверки проектов. "
+        "Отправь мне инструкции с требованиями к проекту, а потом сам проект. "
+        "Я сформирую отчет с результатами ревью!"
+    )
+    await state.set_state(Form.set_instructions_state)
 
 
 @dp.message(F.text)
 async def unknown_command(message: Message):
-    await message.reply("Я не знаю, что делать с этим. Пожалуйста, отправьте мне файл или архив для обработки.")
+    await message.reply("🫤 Я не знаю, что делать с этим. Пожалуйста, отправьте мне файл или архив для обработки.")
 
 
 async def get_file_url(document: types.Document):
