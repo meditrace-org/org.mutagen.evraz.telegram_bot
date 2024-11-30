@@ -3,6 +3,7 @@ import logging
 import os
 import uuid
 import zipfile
+import shutil
 
 import pdfkit
 from aiogram.fsm.context import FSMContext
@@ -300,6 +301,10 @@ async def download_and_archive_documents(user_id, documents):
     logging.info(f"Created archive with file_id={current_file_uuid}")
     return current_file_uuid
 
+def remove_outdated_files():
+    if os.path.exists(data_dir):
+        shutil.rmtree(data_dir)
+        os.makedirs(data_dir, exist_ok=True)
 
 async def on_start():
     await dp.start_polling(bot)
@@ -320,4 +325,5 @@ async def run():
     await asyncio.gather(server_task, bot_task)
 
 if __name__ == '__main__':
+    remove_outdated_files()
     asyncio.run(run())
