@@ -2,7 +2,8 @@ import asyncio
 import os
 import pdfkit
 from aiogram.fsm.context import FSMContext
-from aiogram.types import Message, BufferedInputFile
+from aiogram.types import Message, BufferedInputFile, KeyboardButton, ReplyKeyboardMarkup, BotCommand, \
+    BotCommandScopeDefault
 import aiohttp
 import uvicorn
 from fastapi import FastAPI, Request
@@ -20,15 +21,20 @@ bot = Bot(token=TOKEN)
 dp = Dispatcher()
 cache = TTLCache(maxsize=10000, ttl=3600)
 instructions = dict()
+many_files_dict = dict()
 
 pdfkit_options = {
     'page-size': 'A4',
     'orientation': 'landscape'
 }
 
+many_upload_finish = "✅ Закончить загрузку"
+many_upload_cancel = "⛔️ Отмена"
+
 class Form(StatesGroup):
     set_instructions_state = State()
     default_state = State()
+    many_files_accepting = State()
 
 @app.post("/webhook")
 async def handle_webhook(request: Request):
@@ -64,8 +70,22 @@ async def handle_webhook(request: Request):
         chat_id=chat_id,
         document=input_file,
         reply_to_message_id=message_id,
-        caption="☑️ Ваш отчет успешно составлен."
+        caption="✅ Ваш отчет успешно составлен."
     )
+
+
+@dp.message(Command("upload_many_files"))
+async def upload_many_files_handler(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    if user_id not in instructions:
+        await message.reply("⚠️ Сначала установите инструкции по ревью проекта, используя /set_instr.")
+        return
+    await state.set_state(Form.many_files_accepting)
+    many_files_dict[user_id] = list()
+    if message.document is not None:
+        many_files_dict[user_id].append(message.document)
+    else:
+        await message.reply("📔 Отправьте нужные вам файлы.", reply_markup=await main_kb())
 
 
 @dp.message(Command("set_instr"))
@@ -75,7 +95,7 @@ async def set_instructions_handler(message: types.Message, state: FSMContext):
         await state.set_state(Form.default_state)
     else:
         await state.set_state(Form.set_instructions_state)
-        await message.reply("📝 Отправьте файл с инструкциями в формате PDF.")
+        await message.reply("📝 Отправьте файл с инструкциями в формате PDF.", reply_markup=types.ReplyKeyboardRemove())
 
 
 async def set_instructions(message: types.Message):
@@ -84,7 +104,7 @@ async def set_instructions(message: types.Message):
         has_prev = message.from_user.id in instructions
         instructions[message.from_user.id] = file_url
         await message.reply(
-            f"☑️ Инструкции успешно {'обновлены' if has_prev else 'установлены'}."
+            f"✅ Инструкции успешно {'обновлены' if has_prev else 'установлены'}."
         )
 
 
@@ -100,9 +120,13 @@ async def set_instructions_state_handler(message: types.Message, state: FSMConte
     await state.set_state(Form.default_state)
 
 
-@dp.message(F.content_type == types.ContentType.DOCUMENT)
-async def handle_document_updates(message: types.Message):
+@dp.message(F.content_type == types.ContentType.DOCUMENT, Form.default_state)
+async def handle_document_updates(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
+
+    if state.get_state() == Form.many_files_accepting:
+        many_files_dict[user_id].append(message.document)
+        return
     if user_id not in instructions:
         await message.reply("⚠️ Сначала установите инструкции по ревью проекта, используя /set_instr.")
         return
@@ -134,7 +158,7 @@ async def handle_document_updates(message: types.Message):
 
 @dp.message(CommandStart())
 async def start_message(message: Message, state: FSMContext):
-    if await state.get_state() == Form.default_state:
+    if (await state.get_state()) == Form.default_state:
         await unknown_command(message, state)
         return
     await message.reply(
@@ -145,13 +169,19 @@ async def start_message(message: Message, state: FSMContext):
     await state.set_state(Form.set_instructions_state)
 
 
+@dp.message(Form.many_files_accepting, F.text == many_upload_cancel)
+async def many_upload_cancel_handler(message: types.Message, state: FSMContext):
+    await state.set_state(Form.default_state)
+    await message.reply("Отменено.", reply_markup=types.ReplyKeyboardRemove())
+
+
 @dp.message(F.text)
 async def unknown_command(message: Message,  state: FSMContext):
     current_state = await state.get_state()
     if current_state is None:
         await start_message(message, state)
         return
-    await message.reply("🫤 Я не знаю, что делать с этим. Пожалуйста, отправьте мне файл или архив для обработки.")
+    await message.reply("🫤 Я не знаю, что делать с этим. Пожалуйста, отправьте архив для обработки, или воспользуйтесь командой /upload_many_files")
 
 
 async def get_file_url(document: types.Document):
@@ -163,6 +193,21 @@ async def get_file_url(document: types.Document):
 
 async def is_pdf_document(document: types.Document) -> bool:
     return document.mime_type == "application/pdf"
+
+
+async def main_kb():
+    kb_list = [
+        [KeyboardButton(text=many_upload_finish)],
+        [KeyboardButton(text=many_upload_cancel)]
+    ]
+    keyboard = ReplyKeyboardMarkup(keyboard=kb_list, resize_keyboard=True, one_time_keyboard=True, input_field_placeholder="Отправьте еще файлы или воспользуйтесь меню:")
+    return keyboard
+
+
+async def set_commands():
+    commands = [BotCommand(command='upload_many_files', description='Загрузить несколько файлов'),
+                BotCommand(command='set_instr', description='Установить инструкции')]
+    await bot.set_my_commands(commands, BotCommandScopeDefault())
 
 
 async def on_start():
@@ -177,6 +222,7 @@ async def run():
     bot_task = asyncio.create_task(on_start())
     server_task = asyncio.create_task(server.serve())
 
+    await set_commands()
     await asyncio.gather(server_task, bot_task)
 
 if __name__ == '__main__':
