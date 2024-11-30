@@ -26,6 +26,10 @@ pdfkit_options = {
     'orientation': 'landscape'
 }
 
+class Form(StatesGroup):
+    set_instructions_state = State()
+    default_state = State()
+
 @app.post("/webhook")
 async def handle_webhook(request: Request):
     data = await request.json()
@@ -64,15 +68,11 @@ async def handle_webhook(request: Request):
     )
 
 
-class Form(StatesGroup):
-    set_instructions_state = State()
-
-
 @dp.message(Command("set_instr"))
 async def set_instructions_handler(message: types.Message, state: FSMContext):
     if message.document is not None:
         await set_instructions(message)
-        await state.clear()
+        await state.set_state(Form.default_state)
     else:
         await state.set_state(Form.set_instructions_state)
         await message.reply("📝 Отправьте файл с инструкциями в формате PDF.")
@@ -94,7 +94,7 @@ async def set_instructions_state_handler(message: types.Message, state: FSMConte
         await message.reply("⚠️ Пожалуйста, отправьте файл с инструкциями в формате PDF.")
         return
     await set_instructions(message)
-    await state.clear()
+    await state.set_state(Form.default_state)
 
 
 @dp.message(F.content_type == types.ContentType.DOCUMENT)
@@ -131,6 +131,9 @@ async def handle_document_updates(message: types.Message):
 
 @dp.message(CommandStart())
 async def start_message(message: Message, state: FSMContext):
+    if await state.get_state() == Form.default_state:
+        await unknown_command(message, state)
+        return
     await message.reply(
         "👋 Привет! Я бот для проверки проектов. "
         "Отправь мне инструкции с требованиями к проекту, а потом сам проект. "
@@ -140,7 +143,11 @@ async def start_message(message: Message, state: FSMContext):
 
 
 @dp.message(F.text)
-async def unknown_command(message: Message):
+async def unknown_command(message: Message,  state: FSMContext):
+    current_state = await state.get_state()
+    if current_state is None:
+        await start_message(message, state)
+        return
     await message.reply("🫤 Я не знаю, что делать с этим. Пожалуйста, отправьте мне файл или архив для обработки.")
 
 
