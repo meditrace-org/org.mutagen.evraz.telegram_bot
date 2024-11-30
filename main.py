@@ -1,15 +1,13 @@
-import io
 import asyncio
 import os
-
+import pdfkit
 from aiogram.fsm.context import FSMContext
-from aiogram.types import InputFile, Message, BufferedInputFile
+from aiogram.types import Message, BufferedInputFile
 import aiohttp
 import uvicorn
 from fastapi import FastAPI, Request
 from decouple import config
 from cachetools import TTLCache
-from telebot.types import InputFile
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import CommandStart, Command
 from aiogram.fsm.state import State, StatesGroup
@@ -23,18 +21,21 @@ dp = Dispatcher()
 cache = TTLCache(maxsize=10000, ttl=3600)
 instructions = dict()
 
+pdfkit_options = {
+    'page-size': 'A4',
+    'orientation': 'landscape'
+}
 
 @app.post("/webhook")
 async def handle_webhook(request: Request):
     data = await request.json()
-    if "request_id" not in data or "report_file_url" not in data:
+    if "request_id" not in data or "report_content" not in data:
         request_id = data["request_id"]
         if request_id in cache:
             chat_data = cache[request_id]
             status = data.get("status", "unknown")
             chat_id = chat_data["chat_id"]
             message_id = chat_data["message_id"]
-            await bot.send_message(chat_id, "Запрос не успешный, отсутствует report_file_url.")
             await bot.send_message(
                 chat_id=chat_id,
                 reply_to_message_id=message_id,
@@ -42,7 +43,6 @@ async def handle_webhook(request: Request):
             )
 
     request_id = data["request_id"]
-    report_file_url = data["report_file_url"]
 
     if request_id not in cache:
         return
@@ -51,13 +51,10 @@ async def handle_webhook(request: Request):
     chat_id = chat_data["chat_id"]
     message_id = chat_data["message_id"]
 
-    async with aiohttp.ClientSession() as session:
-        async with session.get(report_file_url) as response:
-            if response.status != 200:
-                return
-            file_data = await response.read()
-
-    input_file = BufferedInputFile(file=file_data, filename="report.pdf")
+    input_file = BufferedInputFile(
+        file=pdfkit.from_url(f"{EVRAZ_API_URL}/reports/{request_id}", False, options=pdfkit_options),
+        filename="report.pdf"
+    )
 
     await bot.send_document(
         chat_id=chat_id,
