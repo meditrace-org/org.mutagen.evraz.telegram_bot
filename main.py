@@ -312,8 +312,15 @@ async def download_and_archive_documents(user_id, documents):
 
 def remove_outdated_files():
     if os.path.exists(data_dir):
-        shutil.rmtree(data_dir)
-        os.makedirs(data_dir, exist_ok=True)
+        for filename in os.listdir(data_dir):
+            file_path = os.path.join(data_dir, filename)
+            try:
+                if os.path.isfile(file_path) or os.path.islink(file_path):
+                    os.unlink(file_path)
+                elif os.path.isdir(file_path):
+                    shutil.rmtree(file_path)
+            except Exception as e:
+                logging.error(f'Failed to delete {file_path}. Reason: {e}')
 
 async def on_start():
     await dp.start_polling(bot)
