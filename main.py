@@ -1,5 +1,9 @@
 import asyncio
+import logging
 import os
+import uuid
+import zipfile
+
 import pdfkit
 from aiogram.fsm.context import FSMContext
 from aiogram.types import Message, BufferedInputFile, KeyboardButton, ReplyKeyboardMarkup, BotCommand, \
@@ -13,15 +17,22 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.filters import CommandStart, Command
 from aiogram.fsm.state import State, StatesGroup
 from aiogram import F
+from starlette.exceptions import HTTPException
+from starlette.responses import FileResponse, Response
 
 app = FastAPI()
 EVRAZ_API_URL = config("EVRAZ_API_URL")
+BOT_API_PORT = config("EVRAZ_TG_BOT_PORT")
+BOT_API_HOST = config("EVRAZ_TG_BOT_HOST")
 TOKEN = config("TELEGRAM_TOKEN")
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 cache = TTLCache(maxsize=10000, ttl=3600)
+many_files_archives = TTLCache(maxsize=10000, ttl=7200)
 instructions = dict()
 many_files_dict = dict()
+
+data_dir = os.path.join(os.path.dirname(__file__), 'data')
 
 pdfkit_options = {
     'page-size': 'A4',
@@ -74,6 +85,35 @@ async def handle_webhook(request: Request):
     )
 
 
+@app.api_route(
+    "/get/{file_id}",
+    methods=["GET", "HEAD"],
+    summary="Скачать файл по id",
+    status_code=200,
+    responses={
+        404: {"description": "Файл не найден"},
+    }
+)
+async def get_file(request: Request, file_id: str):
+    if file_id not in many_files_archives:
+        raise HTTPException(status_code=404, detail="Файл не найден.")
+
+    file_path = many_files_archives[file_id]
+
+    if not os.path.exists(file_path):
+        many_files_archives.pop(file_id)
+        raise HTTPException(status_code=404, detail="Файл не найден на сервере.")
+
+    if request.method == "HEAD":
+        headers = {
+            "content-type": "application/zip",
+            "content-length": str(os.path.getsize(file_path))
+        }
+        return Response(status_code=200, headers=headers)
+
+    return FileResponse(path=file_path, media_type='application/zip', filename=os.path.basename(file_path))
+
+
 @dp.message(Command("upload_many_files"))
 async def upload_many_files_handler(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
@@ -120,24 +160,9 @@ async def set_instructions_state_handler(message: types.Message, state: FSMConte
     await state.set_state(Form.default_state)
 
 
-@dp.message(F.content_type == types.ContentType.DOCUMENT, Form.default_state)
-async def handle_document_updates(message: types.Message, state: FSMContext):
-    user_id = message.from_user.id
-
-    if state.get_state() == Form.many_files_accepting:
-        many_files_dict[user_id].append(message.document)
-        return
-    if user_id not in instructions:
-        await message.reply("⚠️ Сначала установите инструкции по ревью проекта, используя /set_instr.")
-        return
-    if message.document is None:
-        await message.reply("⚠️ Не удалось обработать документ.")
-        return
-
-    target_file_url = await get_file_url(message.document)
-    instructions_file_url = instructions[user_id]
+async def upload_archive(message: types.Message, target_file_url: str):
     data = {
-        "instructions_file_url": instructions_file_url,
+        "instructions_file_url": instructions[message.from_user.id],
         "target_file_url": target_file_url
     }
     async with aiohttp.ClientSession() as session:
@@ -151,9 +176,33 @@ async def handle_document_updates(message: types.Message, state: FSMContext):
                     }
                     await message.reply("⏳ Принято в обработку. Ожидайте.")
                 else:
+                    logging.error(f"Ошибка при отправке данных в АПИ. Код ошибки: {response.status}")
+                    response_data = await response.json()
+                    if response_data:
+                        logging.error(response_data)
                     await message.reply(f"❌ Ошибка при отправке данных в АПИ. Код ошибки: {response.status}")
         except Exception:
             await message.reply("❌ Произошла неизвестная ошибка.")
+
+
+@dp.message(F.content_type == types.ContentType.DOCUMENT, Form.default_state)
+async def handle_document_updates(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+
+    if (await state.get_state()) == Form.many_files_accepting:
+        many_files_dict[user_id].append(message.document)
+        return
+    if user_id not in instructions:
+        await message.reply("⚠️ Сначала установите инструкции по ревью проекта. Отправьте мне PDF-файл.")
+        await state.set_state(Form.set_instructions_state)
+        return
+    if message.document is None:
+        await message.reply("⚠️ Не удалось обработать документ.")
+        return
+
+    target_file_url = await get_file_url(message.document)
+    await upload_archive(message, target_file_url)
+
 
 
 @dp.message(CommandStart())
@@ -171,8 +220,19 @@ async def start_message(message: Message, state: FSMContext):
 
 @dp.message(Form.many_files_accepting, F.text == many_upload_cancel)
 async def many_upload_cancel_handler(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    many_files_dict[user_id].clear()
     await state.set_state(Form.default_state)
     await message.reply("Отменено.", reply_markup=types.ReplyKeyboardRemove())
+
+
+@dp.message(Form.many_files_accepting, F.text == many_upload_finish)
+async def many_upload_cancel_handler(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    file_id = await download_and_archive_documents(user_id, many_files_dict[user_id])
+    target_file_url = f"http://{BOT_API_HOST}:{BOT_API_PORT}/get/{file_id}"
+    await upload_archive(message, target_file_url)
+    await state.set_state(Form.default_state)
 
 
 @dp.message(F.text)
@@ -210,11 +270,45 @@ async def set_commands():
     await bot.set_my_commands(commands, BotCommandScopeDefault())
 
 
+
+async def download_and_archive_documents(user_id, documents):
+    user_dir = os.path.join(data_dir, str(user_id))
+    os.makedirs(user_dir, exist_ok=True)
+
+    async with aiohttp.ClientSession() as session:
+        for doc in documents:
+            file_url = await get_file_url(doc)
+            file_name = os.path.join(user_dir, doc.file_name)
+
+            async with session.get(file_url) as resp:
+                if resp.status == 200:
+                    with open(file_name, 'wb') as f:
+                        f.write(await resp.read())
+                else:
+                    logging.error(f"Ошибка загрузки {file_url}")
+
+    current_file_uuid = str(uuid.uuid4())
+    archive_name = f"{current_file_uuid}.zip"
+    archive_path = os.path.join(data_dir, str(user_id), archive_name)
+
+    with zipfile.ZipFile(archive_path, 'w') as archive:
+        for root, dirs, files in os.walk(user_dir):
+            for file in files:
+                archive.write(os.path.join(root, file), file)
+
+    many_files_archives[current_file_uuid] = archive_path
+    logging.info(f"Created archive with file_id={current_file_uuid}")
+    return current_file_uuid
+
+
 async def on_start():
     await dp.start_polling(bot)
 
 
 async def run():
+    logging.basicConfig(
+        level=logging.INFO,
+    )
     server = uvicorn.Server(
         uvicorn.Config(app, host="0.0.0.0", port=int(os.getenv("EVRAZ_TG_BOT_PORT", "8010")))
     )
