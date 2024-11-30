@@ -93,6 +93,9 @@ async def set_instructions_state_handler(message: types.Message, state: FSMConte
     if message.document is None:
         await message.reply("⚠️ Пожалуйста, отправьте файл с инструкциями в формате PDF.")
         return
+    if not await is_pdf_document(message.document):
+        await message.reply("⚠️ Неверный формат. Пожалуйста, отправьте файл в формате PDF.")
+        return
     await set_instructions(message)
     await state.set_state(Form.default_state)
 
@@ -156,6 +159,10 @@ async def get_file_url(document: types.Document):
     tg_file = await bot.get_file(file_id)
     file_url = f"https://api.telegram.org/file/bot{TOKEN}/{tg_file.file_path}"
     return file_url
+
+
+async def is_pdf_document(document: types.Document) -> bool:
+    return document.mime_type == "application/pdf"
 
 
 async def on_start():
