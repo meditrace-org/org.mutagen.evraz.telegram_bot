@@ -125,8 +125,7 @@ async def upload_many_files_handler(message: types.Message, state: FSMContext):
     many_files_dict[user_id] = list()
     if message.document is not None:
         many_files_dict[user_id].append(message.document)
-    else:
-        await message.reply("📔 Отправьте нужные вам файлы.", reply_markup=await main_kb())
+    await message.reply("📔 Отправьте нужные вам файлы.", reply_markup=await main_kb())
 
 
 @dp.message(Command("set_instr"))
@@ -145,7 +144,8 @@ async def set_instructions(message: types.Message):
         has_prev = message.from_user.id in instructions
         instructions[message.from_user.id] = file_url
         await message.reply(
-            f"✅ Инструкции успешно {'обновлены' if has_prev else 'установлены'}."
+            f"✅ Инструкции успешно {'обновлены' if has_prev else 'установлены'}.\n"
+            f"Теперь вы можете отправить либо архив вашего проекта, либо несколько файлов используя команду /upload_many_files."
         )
 
 
@@ -175,30 +175,33 @@ async def upload_archive(message: types.Message, target_file_url: str):
                         "chat_id": message.chat.id,
                         "message_id": message.message_id
                     }
-                    await message.reply("⏳ Принято в обработку. Ожидайте.")
+                    await message.reply("⏳ Принято в обработку. Ожидайте.", reply_markup=types.ReplyKeyboardRemove())
                 else:
                     logging.error(f"Ошибка при отправке данных в АПИ. Код ошибки: {response.status}")
                     response_data = await response.json()
                     if response_data:
                         logging.error(response_data)
-                    await message.reply(f"❌ Ошибка при отправке данных в АПИ. Код ошибки: {response.status}")
+                    await message.reply(f"❌ Ошибка при отправке данных в АПИ. Код ошибки: {response.status}", reply_markup=types.ReplyKeyboardRemove())
         except Exception:
-            await message.reply("❌ Произошла неизвестная ошибка.")
+            await message.reply("❌ Произошла неизвестная ошибка.", reply_markup=types.ReplyKeyboardRemove())
 
 
-@dp.message(F.content_type == types.ContentType.DOCUMENT, Form.default_state)
+@dp.message(F.content_type == types.ContentType.DOCUMENT)
 async def handle_document_updates(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
 
-    if (await state.get_state()) == Form.many_files_accepting:
-        many_files_dict[user_id].append(message.document)
-        return
-    if user_id not in instructions:
+    if user_id not in instructions or (await state.get_state()) == Form.set_instructions_state:
         await message.reply("⚠️ Сначала установите инструкции по ревью проекта. Отправьте мне PDF-файл.")
         await state.set_state(Form.set_instructions_state)
         return
+    if (await state.get_state()) == Form.many_files_accepting:
+        many_files_dict[user_id].append(message.document)
+        return
     if message.document is None:
         await message.reply("⚠️ Не удалось обработать документ.")
+        return
+    if not await is_zip_document(message.document):
+        await message.reply("❌ Файл не является архивом. Повторите попытку.")
         return
 
     target_file_url = await get_file_url(message.document)
@@ -256,6 +259,10 @@ async def is_pdf_document(document: types.Document) -> bool:
     return document.mime_type == "application/pdf"
 
 
+async def is_zip_document(document: types.Document) -> bool:
+    return document.mime_type == "application/zip"
+
+
 async def main_kb():
     kb_list = [
         [KeyboardButton(text=many_upload_finish)],
@@ -276,6 +283,7 @@ async def download_and_archive_documents(user_id, documents):
     user_dir = os.path.join(data_dir, str(user_id))
     os.makedirs(user_dir, exist_ok=True)
 
+    files = list()
     async with aiohttp.ClientSession() as session:
         for doc in documents:
             file_url = await get_file_url(doc)
@@ -285,6 +293,7 @@ async def download_and_archive_documents(user_id, documents):
                 if resp.status == 200:
                     with open(file_name, 'wb') as f:
                         f.write(await resp.read())
+                        files.append(file_name)
                 else:
                     logging.error(f"Ошибка загрузки {file_url}")
 
@@ -292,10 +301,10 @@ async def download_and_archive_documents(user_id, documents):
     archive_name = f"{current_file_uuid}.zip"
     archive_path = os.path.join(data_dir, str(user_id), archive_name)
 
-    with zipfile.ZipFile(archive_path, 'w') as archive:
-        for root, dirs, files in os.walk(user_dir):
-            for file in files:
-                archive.write(os.path.join(root, file), file)
+    with zipfile.ZipFile(archive_path, 'w') as zipf:
+        for file in files:
+            zipf.write(file, os.path.basename(file))
+            os.remove(file)
 
     many_files_archives[current_file_uuid] = archive_path
     logging.info(f"Created archive with file_id={current_file_uuid}")
